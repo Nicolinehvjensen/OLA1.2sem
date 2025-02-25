@@ -1,0 +1,148 @@
+#### OLA 1
+#### Opgave 5
+# ---------------------------------------------- #
+#           Indlæs nødvendige pakker             #
+# ---------------------------------------------- #
+library(mongolite)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(jsonlite)
+library(shiny)
+library(purrr)
+library(shiny)
+library(ggplot2)
+library(ggsoccer)
+library(caret)
+
+# ---------------------------------------------- #
+#           Forbindelse til MongoDB              #
+# ---------------------------------------------- #
+
+con_matches <- mongo(collection = "matches", 
+                     db = "soccer", 
+                     url = "mongodb://localhost")
+
+con_players <- mongo(collection = "players", 
+                     db = "soccer", 
+                     url = "mongodb://localhost")
+
+con_games <- mongo(collection = "games", 
+                   db = "soccer", 
+                   url = "mongodb://localhost")
+
+con_flattened_events <- mongo(collection = "flattened_events", 
+                              db = "soccer", 
+                              url = "mongodb://localhost")
+
+# ---------------------------------------------- #
+#              Data retrieving                   #
+# ---------------------------------------------- #
+
+# Hent skuddata fra MongoDB
+query_fixed <- jsonlite::toJSON(
+  list(
+    "type.primary" = "shot"
+  ), 
+  auto_unbox = TRUE
+)
+
+shots_alle_alle <- con_games$find(query = query_fixed, fields = '{"_id": 0}')
+
+# ---------------------------------------------- #
+#                 Data prep                      #
+# ---------------------------------------------- #  
+
+# SKAL KØRES 2 OMGANGE
+# Find de kolonner, der har været lister i lister
+nested_cols <- sapply(shots_alle_alle, is.list)  
+
+for (col in names(nested_cols[nested_cols == TRUE])) {
+  if (col %in% names(shots_alle_alle)) {
+    message("Flader ud igen: ", col)
+    shots_alle_alle <- shots_alle_alle %>% unnest_wider(col, names_sep = "_")
+  }
+}
+
+nested_shots <- shots_alle_alle
+
+# ---------------------------------------------- #
+#         Opdeling af test og træningsdata       #
+# ---------------------------------------------- #
+
+# Hent alle matches med deres competitionId
+match_info <- con_matches$find(query = '{}', fields = '{"_id": 1, "competitionId": 1}')
+
+# Omdøb kolonner for at sikre, at de matcher
+colnames(match_info) <- c("matchId", "competitionId")
+
+# Merge skuddata med match-info (tilføj competitionId til skuddata)
+shots_alle <- shots_alle_alle %>%
+  left_join(match_info, by = "matchId")
+
+# Opdel baseret på competitionId
+train_data <- shots_alle %>% filter(competitionId == "692")  # Polsk liga
+test_data <- shots_alle %>% filter(competitionId == "635")   # Hollandsk liga
+
+# ---------------------------------------------- #
+#       Feature Engineering - Skuddata           #
+# ---------------------------------------------- #
+
+# Beregn afstanden til målet baseret på koordinater
+train_data <- train_data %>%
+  mutate(shot_distance = sqrt((100 - location_x)^2 + (50 - location_y)^2))
+
+test_data <- test_data %>%
+  mutate(shot_distance = sqrt((100 - location_x)^2 + (50 - location_y)^2))
+
+# Beregn skudvinkel i grader
+train_data <- train_data %>%
+  mutate(shot_angle = atan2(abs(location_y - 50), (100 - location_x)) * (180 / pi))
+
+test_data <- test_data %>%
+  mutate(shot_angle = atan2(abs(location_y - 50), (100 - location_x)) * (180 / pi))
+
+# Omdan shot_bodyPart til dummy-variabler
+train_data <- train_data %>%
+  mutate(
+    bodyPart_right_foot = ifelse(shot_bodyPart == "right_foot", 1, 0),
+    bodyPart_left_foot = ifelse(shot_bodyPart == "left_foot", 1, 0),
+    bodyPart_head = ifelse(shot_bodyPart == "head", 1, 0)
+  )
+
+test_data <- test_data %>%
+  mutate(
+    bodyPart_right_foot = ifelse(shot_bodyPart == "right_foot", 1, 0),
+    bodyPart_left_foot = ifelse(shot_bodyPart == "left_foot", 1, 0),
+    bodyPart_head = ifelse(shot_bodyPart == "head", 1, 0)
+  )
+
+# ---------------------------------------------- #
+#   Klassifikationsmodel for at forudsige mål   #
+# ---------------------------------------------- #
+
+# Opstil en logistisk regression
+xg_model <- glm(shot_isGoal ~ shot_distance + shot_angle + bodyPart_right_foot + bodyPart_left_foot + bodyPart_head,
+                data = train_data, family = binomial)
+
+# Modelresultater
+summary(xg_model)
+
+# Evaluering på testdata
+test_data$predicted_prob <- predict(xg_model, newdata = test_data, type = "response")
+test_data$predicted_goal <- ifelse(test_data$predicted_prob > 0.2, 1, 0)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = test_data$predicted_goal, Actual = test_data$shot_isGoal)
+print(conf_matrix)
+
+# ---------------------------------------------- #
+#      Kommunikation - Modelrapport              #
+# ---------------------------------------------- #
+
+# Visualisering af skudafstand vs. sandsynlighed for mål
+ggplot(test_data, aes(x = shot_distance, y = predicted_prob)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", color = "blue") +
+  theme_minimal() +
+  labs(title = "Sandsynlighed for mål baseret på skudafstand", x = "Afstand til mål (meter)", y = "Sandsynlighed for mål")
