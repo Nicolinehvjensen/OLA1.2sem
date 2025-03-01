@@ -23,7 +23,7 @@ query <- '{
     ]
 }'
 fields <- '{"matchId": 1, "location": 1, "team": 1, "shot": 1, "type": 1, "player.name": 1, "_id": 0}'
-skuddata <- mongo_conn$find(query, fields = fields)
+skuddata <- mongo_games$find(query, fields = fields)
 
 #Henter kampid, competitionId, seasonId og date fra matches
 kampdata <- mongo_matches$find('{}', '{ "_id": 1, "competitionId": 1, "seasonId": 1, "date": 1 }')
