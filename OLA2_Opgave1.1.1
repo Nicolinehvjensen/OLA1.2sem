@@ -1,0 +1,478 @@
+# OLA 1 - Beskrivende statistik på eventdata
+
+library(tidyverse)
+library(dplyr)
+library(jsonlite)
+library(stringr)
+library(tidyr)
+library(mongolite)
+library(factoextra)
+library(purrr)
+
+# Vi starter lige med at hente alle kampe ind, så vi har dem til senere brug
+{
+# Kode som linker til MongoDB
+con_games=mongo(
+  collection = "games",
+  db = "fodbold",
+  url= "mongodb://localhost"
+)
+
+con_matches=mongo(
+  collection = "matches",
+  db = "fodbold",
+  url= "mongodb://localhost"
+)
+
+con_players=mongo(
+  collection = "players",
+  db = "fodbold",
+  url= "mongodb://localhost"
+)  
+
+allmatches = con_matches$find(query = '{}',fields = '{}')
+
+# Vi henter alle Ekstraklasa kampe
+Ekstraklasa <- allmatches %>% filter(competitionId == 692)
+
+# Vi henter alle Eredivisie kampe
+Eredivisie <- allmatches %>% filter(competitionId == 635)
+}
+
+# Opgave 1.1 – MongoDB
+# Opstil en query i R for at hente følgende fra fodboldkampe liggende i MongoDB:
+{
+# •	Der finder ”RKC Waalwijk”’s hjemmekampe. 
+{
+# Vi connecter til MongoDB
+con_matches=mongo(
+  collection = "matches",
+  db = "fodbold",
+  url= "mongodb://localhost"
+)
+
+# Vi finder vores hold.
+RKC_Waalwijk_Home <- con_matches$find(
+  query = '{ "label": { "$regex": "RKC Waalwijk -" } }',
+  fields = '{}')
+}
+
+view(RKC_Waalwijk_Home)
+
+# •	Der finder antal skud for den hollandske og polske liga
+{
+# Opret forbindelse til MongoDB
+con_games <- mongo(
+  collection = "games", 
+  db = "fodbold", 
+  url = "mongodb://localhost")
+ 
+# Vi laver en query, så vi kan hente de rigtige data
+  query <- toJSON(list(
+    list(
+      "$lookup" = list(
+        "from" = "matches",
+        "localField" = "matchId",
+        "foreignField" = "_id",
+        "as" = "match_info"
+      )
+    ),
+    list(
+      "$unwind" = "$match_info"
+    ),
+    list(
+      "$match" = list(
+        "match_info.competitionId" = list("$in" = c(692, 635)),
+        "shot" = list("$exists" = TRUE, "$ne" = NULL)
+      )
+    ),
+    list(
+      "$group" = list(
+        "_id" = "$match_info.competitionId",
+        "total_shots" = list("$sum" = 1)
+      )
+    )
+  ), auto_unbox = TRUE)
+  
+  Shots_NL_PL <- con_games$aggregate(query)
+}
+view(Shots_NL_PL)
+
+
+# •	Der finder alle skud fra angribere i alle kampe og printer player samt shot-egenskaberne isGoal og onTarget.
+# Kode til at hente skud filtreret i R
+{
+# Vi connecter til mongoDB
+con_games=mongo(
+  collection = "games",
+  db = "fodbold",
+  url= "mongodb://localhost"
+)
+
+# Vi finder alle skud i alle kampe i flattened_events
+  
+allShots_events <- con_games$find(query = '{ "type.primary": "shot" }')
+
+# Vi ændre kolonne fra $ til .
+allShots_events=fromJSON(toJSON(allShots_events),flatten=T)
+
+Shots_Attackers <- allShots_events %>% 
+  filter(player.position == Attacker)
+
+Shots_Attackers <- Shots_Attackers[,c(7,12,18:22,24)]
+}
+view(Shots_Attackers)
+
+# Kode til at hente skud filtreret i Mongo
+
+
+
+# •	Der finder antal spillere som er over 190 høj.
+{
+# Opret forbindelse til MongoDB
+con_players=mongo(
+  collection = "players",
+  db = "fodbold",
+  url= "mongodb://localhost"
+)
+
+# Jeg finder alle spillere
+  
+allPlayers = con_players$find(query = '{}',fields = '{}')
+
+sum(allPlayers$height == 0)
+
+# Vi finder kun spillere med >190cm
+Players_height_190 <- allPlayers %>% 
+  filter(height > 190)
+}
+view(Players_height_190)
+}
+
+#_____________________________________________________________________________#
+
+# Opgave 1.2 - Afleveringer
+{
+{
+# Lav 5-10 figurer, der giver en fodboldtræner et overblik over afleveringer, 
+# herunder præcision i afleveringer (Accurate), registeret som events for kampe 
+# i den polske liga fra sæsonstart 2021/2022 til seneste observation i sæsonen 2022/2023. 
+# Herunder finder I eksempler på, hvad I kunne se nærmere på:
+# a)	Den gennemsnitlige længde på afleveringerne
+# b)	Andel af afleveringer, der rammer en medspiller og den gennemsnitlige længde
+# c)	Den position på banen, der modtager flest aflevering
+# Det forventes i laver flere figurer end punkterne herover, der alene er til 
+# inspiration og ikke en fyldestgørende besvarelse. 
+}
+
+# Vi starter med at hente alle afleveringer i Ekstraklasa
+{
+
+# Vi connecter til MongoDB
+con_matches = mongo(
+  collection = "matches",
+  db = "fodbold",
+  url= "mongodb://localhost"
+)
+
+con_games = mongo(
+  collection = "games",
+  db = "fodbold",
+  url= "mongodb://localhost"
+)
+
+# Hent alle matches med competitionId og seasonId
+all_compID_SeasonID <- con_matches$find(query = '{}', fields = '{"_id": 1, "competitionId": 1, "seasonId": 1}')
+
+# Filtrer for Polish liga (competitionId == "692")
+Ekstraklasa_ID <- all_compID_SeasonID %>% filter(competitionId == "692")
+
+# Hent matchId og seasonId
+polishData <- Ekstraklasa_ID %>% select("_id", seasonId)
+
+# Konverter matchId til liste
+polishId <- polishData$`_id`
+
+# Opret query for at hente pass-events fra mongo_games
+query <- toJSON(
+  list(
+    "matchId" = list("$in" = polishId),  
+    "type.primary" = "pass"
+  ), 
+  auto_unbox = TRUE
+)
+
+# Hent kampdata med ALLE felter fra mongo_games
+test5 <- con_games$find(query = query, fields = '{}')  # Henter alt
+
+# Flet seasonId ind i test-data ved at matche på matchId
+Ekstraklasa_pass <- test5 %>%
+  left_join(polishData, by = c("matchId" = "_id"))
+
+# Vi flattener vores df Ekstraklasa_pass
+library(jsonlite)
+
+# Hvis Ekstraklasa_pass er en liste (fra MongoDB), flatten den
+Ekstraklasa_pass <- as.data.frame(flatten(Ekstraklasa_pass))
+
+}
+View(Ekstraklasa_pass)
+
+# Pass accuracy
+{
+# Vi beregner pass accuracy for alle
+{
+# Vi bruger table function til at tælle succesfulde afleveringer
+Pass_acc_Ekstraklasa <- prop.table(table(Ekstraklasa_pass$type.primary, Ekstraklasa_pass$pass.accurate))
+
+Pass_acc_Ekstraklasa <- as.data.frame(Pass_acc_Ekstraklasa)
+
+# Laver pass accuracy numerisk
+colnames(Pass_acc_Ekstraklasa)[3] <-  "Pass accuracy"
+Pass_acc_Ekstraklasa$`Pass accuracy` <- as.numeric(Pass_acc_Ekstraklasa$`Pass accuracy`)
+}
+
+# Vi beregner pass accuracy
+Pass_acc_Ekstraklasa$`Pass accuracy`[2]*100
+
+# Vi bergegner pass accuracy for målmænd
+{
+Ekstraklasa_pass_Goalie <- Ekstraklasa_pass %>% 
+  filter(player.position %in% Goalkeeper)
+
+# Vi bruger table function til at tælle succesfulde afleveringer
+Pass_acc_Ekstraklasa_Goalie <- prop.table(table(Ekstraklasa_pass_Goalie$type.primary, Ekstraklasa_pass_Goalie$pass.accurate))
+Pass_acc_Ekstraklasa_Goalie <- as.data.frame(Pass_acc_Ekstraklasa_Goalie)
+
+# Laver pass accuracy numerisk
+colnames(Pass_acc_Ekstraklasa_Goalie)[3] <-  "Pass accuracy"
+Pass_acc_Ekstraklasa_Goalie$`Pass accuracy` <- as.numeric(Pass_acc_Ekstraklasa_Goalie$`Pass accuracy`)
+}
+# Vi beregner pass accuracy
+Pass_acc_Ekstraklasa_Goalie$`Pass accuracy`[2]*100
+
+# Vi bergegner pass accuracy for forsvar
+{
+Ekstraklasa_pass_Defender <- Ekstraklasa_pass %>% 
+  filter(player.position %in% Defender)
+
+# Vi bruger table function til at tælle succesfulde afleveringer
+  Pass_acc_Ekstraklasa_Defender <- prop.table(table(Ekstraklasa_pass_Defender$type.primary, 
+                                                    Ekstraklasa_pass_Defender$pass.accurate))
+  Pass_acc_Ekstraklasa_Defender <- as.data.frame(Pass_acc_Ekstraklasa_Defender)
+
+# Laver pass accuracy numerisk
+colnames(Pass_acc_Ekstraklasa_Defender)[3] <-  "Pass accuracy"
+Pass_acc_Ekstraklasa_Defender$`Pass accuracy` <- as.numeric(Pass_acc_Ekstraklasa_Defender$`Pass accuracy`)
+}
+# Vi beregner pass accuracy
+Pass_acc_Ekstraklasa_Defender$`Pass accuracy`[2]*100
+
+# Vi bergegner pass accuracy for midtbane
+{
+Ekstraklasa_pass_Midfielder <- Ekstraklasa_pass %>% 
+  filter(player.position %in% Midfielder)
+
+# Vi bruger table function til at tælle succesfulde afleveringer
+  Pass_acc_Ekstraklasa_Midfielder <- prop.table(table(Ekstraklasa_pass_Midfielder$type.primary, Ekstraklasa_pass_Midfielder$pass.accurate))
+  Pass_acc_Ekstraklasa_Midfielder <- as.data.frame(Pass_acc_Ekstraklasa_Midfielder)
+
+# Laver pass accuracy numerisk
+colnames(Pass_acc_Ekstraklasa_Midfielder)[3] <-  "Pass accuracy"
+Pass_acc_Ekstraklasa_Midfielder$`Pass accuracy` <- as.numeric(Pass_acc_Ekstraklasa_Midfielder$`Pass accuracy`)
+}
+# Vi beregner pass accuracy
+Pass_acc_Ekstraklasa_Midfielder$`Pass accuracy`[2]*100
+
+# Vi bergegner pass accuracy for angreb
+{
+Ekstraklasa_pass_Attacker <- Ekstraklasa_pass %>% 
+  filter(player.position %in% Attacker)
+
+# Vi bruger table function til at tælle succesfulde afleveringer
+  Pass_acc_Ekstraklasa_Attacker <- prop.table(table(Ekstraklasa_pass_Attacker$type.primary, Ekstraklasa_pass_Attacker$pass.accurate))
+  Pass_acc_Ekstraklasa_Attacker <- as.data.frame(Pass_acc_Ekstraklasa_Attacker)
+
+# Laver pass accuracy numerisk
+colnames(Pass_acc_Ekstraklasa_Attacker)[3] <-  "Pass accuracy"
+Pass_acc_Ekstraklasa_Attacker$`Pass accuracy` <- as.numeric(Pass_acc_Ekstraklasa_Attacker$`Pass accuracy`)
+}
+# Vi beregner pass accuracy
+Pass_acc_Ekstraklasa_Attacker$`Pass accuracy`[2]*100
+}
+
+# Position med flest afleveringer samt pass accuracy
+{
+Ekstraklasa_pass_sum <- Ekstraklasa_pass[, c(14,26:27)]
+
+# Vi grupperer vores positioner, så vi kan lave et plot.
+library(dplyr)
+
+# Definér bredere positioner med labels til fodboldbanen
+position_groups <- list(
+  "Right Back" = c("RB", "RWB", "RB5"),
+  "Left Back" = c("LB", "LWB", "LB5"),
+  "Center Back" = c("CB","RCB", "RCB3","LCB", "LCB3"),
+  "Defensive Midfielder" = c("DMF", "LDMF", "RDMF"),
+  "Right Central Midfielder" = c("RCMF", "RCMF3"),
+  "Left Central Midfielder" = c("LCMF", "LCMF3"),
+  "Attacking Midfielder" = c("AMF", "RAMF", "LAMF"),
+  "Right Winger" = c("RW", "RWF"),
+  "Left Winger" = c("LW", "LWF"),
+  "Striker" = c("SS", "CF"),
+  "Goalkeeper" = c("GK")
+)
+
+# Funktion til at matche positioner med den nye kategori
+assign_position_group <- function(pos) {
+  for (group in names(position_groups)) {
+    if (pos %in% position_groups[[group]]) {
+      return(group)
+    }
+  }
+  return(NA) # Hvis position ikke matcher, returner NA
+}
+
+# Anvend funktionen til at skabe en ny kolonne med bredere positioner
+Ekstraklasa_pass_sum <- Ekstraklasa_pass_sum %>%
+  mutate(broad_position = sapply(player.position, assign_position_group))
+
+# Vi beregner antal afleveringer samt pass accuracy for hver position.
+Ekstraklasa_pass_acc_pos <- Ekstraklasa_pass_sum %>%
+  group_by(broad_position) %>%
+  summarise(
+    total_passes = n(),
+    accurate_passes = sum(pass.accurate, na.rm = TRUE),
+    pass_accuracy = round((accurate_passes / total_passes) * 100, 2)
+  ) %>%
+  arrange(desc(pass_accuracy))
+
+Ekstraklasa_pass_acc_pos <- na.omit(Ekstraklasa_pass_acc_pos)
+
+# Se resultatet
+print(Ekstraklasa_pass_acc_pos)
+
+# Til sidst plotter vi vores accuracy
+library(ggplot2)
+
+# Definér koordinater for spillernes positioner på banen
+position_coords <- data.frame(
+  broad_position = c("Goalkeeper", "Right Back", "Left Back", "Center Back",
+                     "Defensive Midfielder", "Right Central Midfielder", "Left Central Midfielder",
+                     "Attacking Midfielder", "Right Winger", "Left Winger", "Striker"),
+  x = c(5, 20, 20, 20, 40, 50, 50, 60, 70, 70, 85),  # Juster X-koordinater for realistisk placering
+  y = c(50, 80, 20, 50, 50, 60, 40, 50, 80, 20, 50)   # Juster Y-koordinater
+)
+
+# Merge positioner med accuracy data
+plot_data <- merge(Ekstraklasa_pass_acc_pos, position_coords, by = "broad_position", all.y = TRUE)
+
+# Tilføj labels med både antal afleveringer og pass accuracy
+plot_data$label <- paste0(plot_data$broad_position, "\n",
+                          "Passes: ", plot_data$total_passes, "\n",
+                          "Accuracy: ", plot_data$pass_accuracy, "%")
+
+# Tegn fodboldbanen
+ggplot(plot_data, aes(x = x, y = y)) +
+  # Tegn punkter for hver spiller
+  geom_point(aes(size = pass_accuracy, color = pass_accuracy), alpha = 0.8) +  
+  # Tilføj labels med position, antal afleveringer og accuracy
+  geom_text(aes(label = label), vjust = -1, size = 2.5) +  
+  # Skala for størrelse af prikker
+  scale_size_continuous(range = c(5, 15)) +  
+  # Farveskala fra rød (lav accuracy) til grøn (høj accuracy)
+  scale_color_gradient(low = "red", high = "green") +  
+  # Baggrund, der ligner en fodboldbane
+  annotate("rect", xmin = 0, xmax = 100, ymin = 0, ymax = 100, fill = "green", alpha = 0.3) +  # Banen
+  annotate("rect", xmin = 0, xmax = 10, ymin = 30, ymax = 70, color = "white", fill = NA, size = 1) +  # Målområde venstre
+  annotate("rect", xmin = 90, xmax = 100, ymin = 30, ymax = 70, color = "white", fill = NA, size = 1) +  # Målområde højre
+  annotate("rect", xmin = 0, xmax = 100, ymin = 0, ymax = 100, color = "white", fill = NA, size = 1) +  # Yderste linjer
+  annotate("point", x = 50, y = 50, color = "white", size = 3) +  # Midtercirkel
+  annotate("rect", xmin = 40, xmax = 60, ymin = 40, ymax = 60, color = "white", fill = NA, size = 1) +  # Midtercirkel
+  # Titler og layout
+  labs(title = "Pass Accuracy per Position on a Football Pitch",
+       x = "", y = "", color = "Pass Accuracy (%)") +
+  theme_minimal() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank())
+}
+view(Ekstraklasa_pass_acc_pos)
+
+# Position med flest modtagelser af afleveringer
+{
+# Vi beregner antal afleveringer samt pass accuracy for hver position.
+
+Ekstraklasa_pass_receive <- Ekstraklasa_pass[, c(14,27,32:33)]
+
+# Anvend funktionen til at skabe en ny kolonne med bredere positioner
+Ekstraklasa_pass_receive <- Ekstraklasa_pass_receive %>%
+  mutate(broad_position = sapply(pass.recipient.position, assign_position_group))
+
+# # Vi beregner antal receives for hver position.
+Ekstraklasa_Top_recievers <- Ekstraklasa_pass_receive %>% 
+  group_by(pass.recipient.position, pass.recipient.name) %>% 
+  summarise(total_receives = n()) %>% 
+  arrange(desc(total_receives)) %>% 
+  na.omit()
+}
+view(Ekstraklasa_Top_recievers)
+}
+
+#_____________________________________________________________________________#
+
+
+# Opgave 1,3 - Skud og mål
+{
+# Lav 5-10 figurer, der giver en fodboldtræner et overblik over skud, herunder specielt mål, 
+# registeret som events i filerne, registeret som events for kampe i den polske liga fra sæsonstart 2021/2022
+# til seneste observation i sæsonen 2022/2023. Herunder finder I eksempler på, hvad I kunne se nærmere på:
+#  a)	Den gennemsnitlige længde og vinkel til målet for skuddene
+#  b)	Andel af skud, der bliver til mål i forhold til antallet af skud
+#  c)	Den gennemsnitlige xG for alle skud, der ramte målet
+#  d)	Etc.
+}
+
+# Vi starter med at hente alle skud fra Ekstraklasa
+{
+# Vi connecter til mongoDB
+con_events=mongo(
+  collection = "games",
+  db = "fodbold",
+  url= "mongodb://localhost"
+)
+
+# Vi finder alle skud i alle kampe i flattened_events
+allShots_events <- con_games$find(query = '{ "type.primary": "shot" }')
+
+# Vi ændre kolonne fra $ til .
+allShots_events=fromJSON(toJSON(allShots_events),flatten=T)
+}
+
+# Vi finder ud af, hvor mange afslutninger, som giver mål.
+{
+  # Vi bruger table function til at tælle succesfulde skud
+  isGoal_Ekstraklasa <- prop.table(table(Ekstraklasa_shot$type.primary, Ekstraklasa_shot$shot.isGoal))
+  
+  isGoal_Ekstraklasa <- as.data.frame(isGoal_Ekstraklasa)
+  
+  # Laver score ratio numerisk
+  colnames(isGoal_Ekstraklasa)[3] <-  "isGoal"
+  isGoal_Ekstraklasa$`isGoal` <- as.numeric(isGoal_Ekstraklasa$`isGoal`)
+  
+  # Vi beregner score ratio
+  isGoal_Ekstraklasa$`isGoal`[2]*100
+  }
+
+# Vi finder gennemsnitlige vinkel og længde, som giver mål.
+{
+Ekstraklasa_shot_isGoal <- Ekstraklasa_shot %>% 
+  filter(shot.isGoal == TRUE)
+
+Ekstraklasa_shot_LængdeVinkel <- Ekstraklasa_shot_isGoal[,c("location.x","location.y")]
+Ekstraklasa_shot_LængdeVinkel <- colMeans(Ekstraklasa_shot_LængdeVinkel, na.rm = TRUE)
+Ekstraklasa_shot_LængdeVinkel <- as.data.frame(Ekstraklasa_shot_LængdeVinkel)
+}
+View(Ekstraklasa_shot_LængdeVinkel)
+
+
+
+
