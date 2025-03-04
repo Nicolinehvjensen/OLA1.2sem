@@ -1,0 +1,368 @@
+#### OLA 1
+#### Opgave 1.3
+
+library(jsonlite)
+
+games_url <- "https://raw.githubusercontent.com//LucasNeumann99/Wyscout/main/games.metadata.json"
+matches_url <- "https://raw.githubusercontent.com//LucasNeumann99/Wyscout/main/matches.metadata.json"
+players_url <- "https://raw.githubusercontent.com//LucasNeumann99/Wyscout/main/players.metadata.json"
+
+games <- fromJSON(games_url)
+matches <- fromJSON(matches_url)
+players <- fromJSON(players_url)
+
+# ---------------------------------------------- #
+#           Indlæs nødvendige pakker             #
+# ---------------------------------------------- #
+library(mongolite)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(jsonlite)
+library(shiny)
+library(purrr)
+library(shiny)
+library(ggplot2)
+library(ggsoccer)
+# ---------------------------------------------- #
+#           Forbindelse til MongoDB              #
+# ---------------------------------------------- #
+
+con_matches <- mongo(collection = "matches", 
+                     db = "soccer", 
+                     url = "mongodb://localhost")
+
+con_players <- mongo(collection = "players", 
+                     db = "soccer", 
+                     url = "mongodb://localhost")
+
+con_games <- mongo(collection = "games", 
+                   db = "soccer", 
+                   url = "mongodb://localhost")
+
+con_flattened_events <- mongo(collection = "flattened_events", 
+                              db = "soccer", 
+                              url = "mongodb://localhost")
+
+#Opgave 1.3 Skud
+
+
+# ---------------------------------------------- #
+#              Data retrieving skud              #
+# ---------------------------------------------- #
+
+# Hent skuddata fra MongoDB
+allMatches <- con_matches$find(query = '{}', fields = '{}')
+allPolish <- allMatches %>% filter(competitionId == "692")
+polishId <- allPolish["_id"]
+polishId_vec <- unlist(polishId)
+
+query_fixed <- jsonlite::toJSON(
+  list(
+    "matchId" = list("$in" = polishId_vec),  # Brug den rene vektor
+    "type.primary" = "shot"
+  ), 
+  auto_unbox = TRUE
+)
+
+shots <- con_games$find(query = query_fixed, fields = '{"_id": 0}')
+
+# ---------------------------------------------- #
+#                 Data prep                      #
+# ---------------------------------------------- #  
+
+# Kør loop indtil der ikke er flere nested lists
+repeat {
+  # Find kolonner med nested lists
+  nested_cols <- sapply(shots, is.list)
+  
+  # Stop løkken, hvis der ikke er flere nested lists
+  if (all(nested_cols == FALSE)) {
+    break
+  }
+  
+  # Flad de nested lists ud
+  for (col in names(nested_cols[nested_cols == TRUE])) {
+    if (col %in% names(shots)) {
+      message("Flader ud: ", col)
+      shots <- shots %>% unnest_wider(col, names_sep = "_")
+    }
+  }
+}
+
+# Gem det færdige resultat
+shots_alle <- shots
+
+# ---------------------------------------------- #
+#               Tilføj competionsid              #
+# ---------------------------------------------- #
+
+# Hent alle matches med deres competitionId
+match_info <- con_matches$find(query = '{}', fields = '{"_id": 1, "competitionId": 1}')
+
+# Omdøb kolonner for at sikre, at de matcher
+colnames(match_info) <- c("matchId", "competitionId")
+
+# Merge skuddata med match-info (tilføj competitionId til skuddata)
+shots_alle <- shots_alle %>%
+  left_join(match_info, by = "matchId")
+
+# ---------------------------------------------- #
+#             Fjern af data ved fejl             #
+# ---------------------------------------------- #
+
+# Tæl hvor mange skud er fejlagtigt i 2H men <= 45 minutter
+antal_fejl <- shots_alle %>%
+  filter(matchPeriod == "2H" & minute <= 45) %>%
+  nrow()
+
+cat("Antal skud der fejlagtigt er i 2. halvleg, men <= 45 min:", antal_fejl, "\n")
+
+#Fjern fejl
+shots_alle <- shots_alle %>%
+  filter(!(matchPeriod == "2H" & minute <= 45))
+
+
+# ---------------------------------------------- #
+#                 Shiny app                      #
+# ---------------------------------------------- #  
+
+library(shiny)
+library(shinythemes)
+library(ggplot2)
+library(ggsoccer)
+library(dplyr)
+library(tidyr)
+library(bslib)
+library(viridis)
+library(rsconnect)
+
+app_theme <- shinytheme("superhero")
+
+# UI
+ui <- fluidPage(
+  theme = app_theme,
+  
+  div(style = "background-color: #2c3e50; padding: 15px; color: white; text-align: center; font-size: 36px; font-weight: bold; padding-bottom: 20px;",
+      "⚽ Opgave 1.3 - Polsk Liga Visualiseringer"),
+  
+  tabsetPanel(
+    tabPanel("Skud & Spillere",
+             sidebarLayout(
+               sidebarPanel(
+                 sliderInput("numPlayers", "Vælg antal spillere:", min = 5, max = 20, value = 10, step = 1, round = TRUE, ticks = FALSE),
+                 selectInput("team", "Vælg hold:", choices = c("Alle" = "all", unique(shots_alle$team_name)))
+               ),
+               mainPanel(
+                 div(style = "display: flex; flex-direction: column; align-items: center;",
+                     div(style = "background-color: black; padding: 20px; border-radius: 15px; border: 10px solid #222; width: 1000px;",
+                         plotOutput("xg_vs_goal", height = "700px", width = "100%")
+                     ),
+                     div(style = "background-color: black; width: 300px; height: 50px; margin-top: 20px; border-radius: 10px;") # Større fod
+                 )
+               )
+             )
+    ),
+    
+    tabPanel("Holdanalyse",
+             sidebarLayout(
+               sidebarPanel(
+                 selectInput("holdType", "Vælg holdvisualisering:", choices = c("Holdenes Mål og xG"))
+               ),
+               mainPanel(
+                 div(style = "display: flex; flex-direction: column; align-items: center;",
+                     div(style = "background-color: black; padding: 20px; border-radius: 15px; border: 10px solid #222; width: 1000px;",
+                         plotOutput("team_xg_vs_goal", height = "700px", width = "100%")
+                     ),
+                     div(style = "background-color: black; width: 300px; height: 50px; margin-top: 20px; border-radius: 10px;")
+                 )
+               )
+             )
+    ),
+    
+    tabPanel("Skud Analyse",
+             sidebarLayout(
+               sidebarPanel(
+                 selectInput("skudType", "Vælg skudvisualisering:", choices = c("Skud per minut", "Skud efter kropsdel"))
+               ),
+               mainPanel(
+                 div(style = "display: flex; flex-direction: column; align-items: center;",
+                     div(style = "background-color: black; padding: 20px; border-radius: 15px; border: 10px solid #222; width: 1000px;",
+                         plotOutput("skud_plot", height = "700px", width = "100%")
+                     ),
+                     div(style = "background-color: black; width: 300px; height: 50px; margin-top: 20px; border-radius: 10px;")
+                 )
+               )
+             )
+    ),
+    
+    tabPanel("Heatmaps",
+             sidebarLayout(
+               sidebarPanel(
+                 selectInput("heatmapType", "Vælg heatmap:", choices = c("Skud Heatmap", "Mål Heatmap"))
+               ),
+               mainPanel(
+                 div(style = "display: flex; flex-direction: column; align-items: center;",
+                     div(style = "background-color: black; padding: 20px; border-radius: 15px; border: 10px solid #222; width: 1000px;",
+                         plotOutput("heatmap", height = "700px", width = "100%")
+                     ),
+                     div(style = "background-color: black; width: 300px; height: 50px; margin-top: 20px; border-radius: 10px;")
+                 )
+               )
+             )
+    )
+  )
+)
+
+
+# Server
+server <- function(input, output) {
+  filtered_shots <- reactive({
+    data <- shots_alle %>% filter(competitionId == 692)
+    if (input$team != "all") {
+      data <- data %>% filter(team_name == input$team)
+    }
+    data %>% mutate(shot_angle = atan2(abs(location_y - 50), (100 - location_x)) * (180 / pi),
+                    shot_distance = sqrt((100 - location_x)^2 + (50 - location_y)^2))
+  })
+  
+  # xG vs. Faktiske Mål pr. spiller
+  output$xg_vs_goal <- renderPlot({
+    data <- filtered_shots() %>%
+      group_by(player_name) %>%
+      summarise(xG = sum(shot_xg), Mål = sum(shot_isGoal)) %>%
+      arrange(desc(Mål)) %>%
+      head(input$numPlayers)
+    
+    ggplot(data, aes(x = reorder(player_name, -Mål))) +
+      geom_col(aes(y = Mål), fill = "#f39c12", width = 0.6) +
+      geom_point(aes(y = xG), color = "yellow", size = 5) +
+      geom_text(aes(y = Mål, label = Mål), vjust = -0.5, size = 6, fontface = "bold") +
+      theme_minimal(base_size = 20) +
+      labs(title = "Spillernes Mål og xG-sum", x = "Spiller", y = "Antal Mål / xG") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 16),
+            axis.text.y = element_text(size = 16),
+            plot.title = element_text(size = 36, face = "bold"))
+  })
+  
+  # xG vs. Faktiske Mål pr. hold
+  output$team_xg_vs_goal <- renderPlot({
+    data <- filtered_shots() %>%
+      group_by(team_name) %>%
+      summarise(xG = sum(shot_xg), Mål = sum(shot_isGoal)) %>%
+      arrange(desc(Mål))
+    
+    ggplot(data, aes(x = reorder(team_name, -Mål))) +
+      geom_col(aes(y = Mål), fill = "#f39c12", width = 0.6) +
+      geom_point(aes(y = xG), color = "yellow", size = 5) +
+      geom_text(aes(y = Mål, label = Mål), vjust = -0.5, size = 6, fontface = "bold") +
+      theme_minimal(base_size = 20) +
+      labs(title = "Holdenes Mål og xG-sum", x = "Hold", y = "Antal Mål / xG") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 16),
+            axis.text.y = element_text(size = 16),
+            plot.title = element_text(size = 36, face = "bold"))
+  })
+  
+  # Heatmaps
+  output$heatmap <- renderPlot({
+    data <- filtered_shots()
+    
+    if (input$heatmapType == "Skud Heatmap") {
+      ggplot(data) +
+        annotate_pitch(dimensions = pitch_opta, fill = "#2e8b57", colour = "white") +
+        stat_density_2d(geom = "polygon", aes(location_x, location_y, fill = ..level..), alpha = 0.8) +
+        scale_fill_viridis(option = "C") +
+        theme_void() +
+        labs(title = "Heatmap over Skud") +
+        theme(plot.title = element_text(size = 36, face = "bold", hjust = 0.2))
+    } else {
+      ggplot(data %>% filter(shot_isGoal == 1)) +
+        annotate_pitch(dimensions = pitch_opta, fill = "#2e8b57", colour = "white") +
+        stat_density_2d(geom = "polygon", aes(location_x, location_y, fill = ..level..), alpha = 0.8) +
+        scale_fill_viridis(option = "C") +
+        theme_void() +
+        labs(title = "Heatmap over Mål") +
+        theme(plot.title = element_text(size = 36, face = "bold", hjust = 0.2))
+    }
+  })
+    
+  # Skudanalyse
+  output$skud_plot <- renderPlot({
+    data <- filtered_shots()
+    if (is.null(data)) return()
+    
+    if (input$skudType == "Skud per minut") {
+      
+      data <- data %>%
+        mutate(Fase = case_when(
+          minute <= 15 ~ "0-15 min",
+          minute <= 30 ~ "16-30 min",
+          minute <= 45 ~ "31-45 min",
+          matchPeriod == "1H" & minute > 45 ~ "Overtid 1H",  # Specifik overtid for 1H
+          minute <= 60 ~ "46-60 min",
+          minute <= 75 ~ "61-75 min",
+          minute <= 90 ~ "76-90 min",
+          matchPeriod == "2H" & minute > 90 ~ "Overtid 2H"   # Specifik overtid for 2H
+        )) 
+      
+      ggplot(data, aes(x = Fase, fill = matchPeriod)) +
+        geom_bar(color = "black") +
+        theme_minimal(base_size = 18) +
+        scale_fill_manual(values = c("1H" = "#1f78b4", "2H" = "#33a02c", "Overtid 1H" = "#ff7f00", "Overtid 2H" = "#e31a1c")) + 
+        labs(title = "Skud opdelt i kampfaser, markant forskel på skud i overtiden fra 1H til 2H", 
+             x = "Kampfase", y = "Antal skud", fill = "Halvleg") +
+        theme(
+          plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 16),
+          axis.text.y = element_text(size = 16),
+          axis.title.x = element_text(size = 18, face = "bold"),
+          axis.title.y = element_text(size = 18, face = "bold")
+        )
+      
+    } else {
+      
+      # Skud efter kropsdel
+      data_count <- data %>%
+        count(shot_bodyPart, name = "Antal") %>%
+        mutate(Kropsdel = case_when(
+          shot_bodyPart == "head_or_other" ~ "Hoved/Andet",
+          shot_bodyPart == "left_foot" ~ "Venstre fod",
+          shot_bodyPart == "right_foot" ~ "Højre fod",
+          TRUE ~ "Ukendt"
+        ))
+      
+      ggplot(data_count, aes(y = reorder(Kropsdel, Antal), x = Antal, fill = Kropsdel)) +
+        geom_col(width = 0.6) +  
+        geom_text(aes(label = Antal), hjust = 1.1, size = 6, fontface = "bold", color = "white") + # Justeret position og farve
+        scale_fill_manual(values = c("Hoved/Andet" = "#f39c12", "Venstre fod" = "#2e8b57", "Højre fod" = "#1f78b4")) +
+        theme_minimal(base_size = 18) +
+        labs(title = "Fordeling af skud efter kropsdel",
+             x = "Antal skud", y = "Kropsdel") +
+        theme(
+          plot.title = element_text(size = 28, face = "bold", hjust = 0.5),
+          axis.text.x = element_text(size = 16),
+          axis.text.y = element_text(size = 16),
+          axis.title.x = element_text(size = 18, face = "bold"),
+          axis.title.y = element_text(size = 18, face = "bold"),
+        )
+    }
+  })
+  
+ }
+
+
+# Kør app
+shinyApp(ui, server)
+
+
+# Launch app på shinyapps.io
+rsconnect::setAccountInfo(name='lucasshiny', 
+                          token='708E2F47D0A6CEC1ADE3034E600C12C0', 
+                          secret='omFg4uu0Bu4CR43IhQDKRvgVq3c2B6rRAnMpYcZA')
+
+rsconnect::deployApp('/Users/lucas/Desktop/Dataanalyse/Semester2/OLA1/OLA1_3')
+
+
+
+
+
