@@ -1,0 +1,253 @@
+#### OLA 1
+#### Opgave 1.2
+
+# ---------------------------------------------- #
+#           Indlæs nødvendige pakker             #
+# ---------------------------------------------- #
+library(mongolite)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(jsonlite)
+library(shiny)
+library(purrr)
+library(shiny)
+library(ggplot2)
+library(ggsoccer)
+# ---------------------------------------------- #
+#           Forbindelse til MongoDB              #
+# ---------------------------------------------- #
+
+con_matches <- mongo(collection = "matches", 
+                     db = "soccer", 
+                     url = "mongodb://localhost")
+
+con_players <- mongo(collection = "players", 
+                     db = "soccer", 
+                     url = "mongodb://localhost")
+
+con_games <- mongo(collection = "games", 
+                   db = "soccer", 
+                   url = "mongodb://localhost")
+
+con_flattened_events <- mongo(collection = "flattened_events", 
+                              db = "soccer", 
+                              url = "mongodb://localhost")
+
+#Opgave 1.2 Afleveringer
+  
+  #1.2.1.	Lav 5-10 figurer, der giver en fodboldtræner et overblik over afleveringer, herunder præcision.
+  # Polske liga fra sæsonstart 2021/2022 til seneste observation i sæsonen 2022/2023.
+  
+  # ---------------------------------------------- #
+  #              Data retrieving                   #
+  # ---------------------------------------------- # 
+  
+  allMatches <- con_matches$find(query = '{}', fields = '{}')
+  allPolish <- allMatches %>% filter(competitionId == "692")
+  polishId <- allPolish[["_id"]]
+  polishId_vec <- unlist(polishId)
+  
+  query <- jsonlite::toJSON(
+    list(
+      "matchId" = list("$in" = polishId_vec),  # Brug den rene vektor
+      "type.primary" = "pass"
+    ), 
+    auto_unbox = TRUE
+  )
+  
+  test <- con_games$find(query = query, fields = '{"_id": 0}')
+  
+  Afleveringer <- test
+  
+  # ---------------------------------------------- #
+  #                 Data prep                      #
+  # ---------------------------------------------- #  
+  
+  
+  # Kør loop indtil der ikke er flere nested lists
+  repeat {
+    # Find kolonner med nested lists
+    nested_cols <- sapply(Afleveringer, is.list)
+    
+    # Stop løkken, hvis der ikke er flere nested lists
+    if (all(nested_cols == FALSE)) {
+      break
+    }
+    
+    # Flad de nested lists ud
+    for (col in names(nested_cols[nested_cols == TRUE])) {
+      if (col %in% names(Afleveringer)) {
+        message("Flader ud: ", col)
+        Afleveringer <- Afleveringer %>% unnest_wider(col, names_sep = "_")
+      }
+    }
+  }
+  
+  # ---------------------------------------------- #
+  #                 Shiny app                      #
+  # ---------------------------------------------- #  
+  
+  library(shiny)
+  library(shinythemes)
+  library(ggplot2)
+  library(ggsoccer)
+  library(dplyr)
+  library(tidyr)
+  library(viridis)
+  library(ggExtra)
+  
+  app_theme <- shinytheme("superhero")
+  
+  # UI
+  ui <- navbarPage(
+    theme = app_theme,
+    "Fodboldanalyse",
+    
+    tabPanel("Opgave 1.2 Afleveringer",
+             fluidPage(
+               div(style = "background-color: #2c3e50; padding: 15px; color: white; text-align: center; font-size: 36px; font-weight: bold; padding-bottom: 20px;",
+                   "⚽ Afleveringsanalyse - Polsk Liga"),
+               
+               tabsetPanel(
+                 tabPanel("Afleveringspræcision",
+                          sidebarLayout(
+                            sidebarPanel(
+                              selectInput("passAccuracyType", "Vælg visualisering:", 
+                                          choices = c("Top hold", "Top spillere")),
+                              sliderInput("numTeamsPlayers", "Vælg antal:", min = 5, max = 20, value = 10, step = 1)
+                            ),
+                            mainPanel(
+                              div(style = "border: 10px solid black; border-radius: 15px; padding: 10px; background-color: #000;", 
+                                  plotOutput("pass_accuracy_plot", height = "700px"))
+                            )
+                          )
+                 ),
+                 
+                 tabPanel("Afleveringslængde",
+                          sidebarLayout(
+                            sidebarPanel(
+                              selectInput("passLengthType", "Vælg visualisering:", 
+                                          choices = c("Gennemsnit pr. hold", "Gennemsnit pr. spiller")),
+                              sliderInput("numTeamsPlayersLength", "Vælg antal:", min = 5, max = 20, value = 10, step = 1)
+                            ),
+                            mainPanel(
+                              div(style = "border: 10px solid black; border-radius: 15px; padding: 10px; background-color: #000;", 
+                                  plotOutput("pass_length_plot", height = "700px"))
+                            )
+                          )
+                 ),
+                 
+                 tabPanel("Heatmaps",
+                          sidebarLayout(
+                            sidebarPanel(
+                              selectInput("heatmapType", "Vælg heatmap:", choices = c("Afleveringsmodtagelser"))
+                            ),
+                            mainPanel(
+                              div(style = "border: 10px solid black; border-radius: 15px; padding: 10px; background-color: #000; margin-top: 30px;", 
+                                  plotOutput("pass_heatmap", height = "700px"))
+                            )
+                          )
+                 )
+               )
+             )
+    )
+  )
+  
+  # Server
+  server <- function(input, output) {
+    filtered_data <- reactive({
+      data <- Afleveringer
+      if (nrow(data) == 0) return(NULL)
+      data
+    })
+    
+    # Afleveringspræcision
+    output$pass_accuracy_plot <- renderPlot({
+      data <- filtered_data()
+      if (is.null(data)) return()
+      
+      plot_data <- if (input$passAccuracyType == "Top hold") {
+        data %>%
+          group_by(possession_team_name) %>%
+          summarise(Præcision = mean(pass_accurate, na.rm = TRUE) * 100) %>%
+          arrange(desc(Præcision)) %>%
+          slice_head(n = input$numTeamsPlayers)
+      } else {
+        data %>%
+          group_by(player_name) %>%
+          filter(n() > 100) %>%
+          summarise(Præcision = mean(pass_accurate, na.rm = TRUE) * 100) %>%
+          arrange(desc(Præcision)) %>%
+          slice_head(n = input$numTeamsPlayers)
+      }
+      
+      if (nrow(plot_data) == 0) return()
+      
+      x_var <- if (input$passAccuracyType == "Top hold") sym("possession_team_name") else sym("player_name")
+      
+      ggplot(plot_data, aes(x = reorder(!!x_var, Præcision), y = Præcision)) +
+        geom_col(fill = "#f39c12", width = 0.6) +
+        geom_text(aes(label = round(Præcision, 1)), vjust = -0.5, size = 5, color = "white") +
+        theme_minimal() +
+        labs(title = paste(input$passAccuracyType, "med afleveringspræcision"), x = input$passAccuracyType, y = "Afleveringspræcision (%)") +
+        theme(plot.title = element_text(size = 36, face = "bold"),
+              axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+              axis.text.y = element_text(size = 16),
+              axis.title.x = element_text(size = 20, face = "bold"),
+              axis.title.y = element_text(size = 20, face = "bold"))
+    })
+    
+    # Afleveringslængde
+    output$pass_length_plot <- renderPlot({
+      data <- filtered_data()
+      if (is.null(data)) return()
+      
+      plot_data <- if (input$passLengthType == "Gennemsnit pr. hold") {
+        data %>%
+          group_by(possession_team_name) %>%
+          summarise(Gennemsnit = mean(pass_length, na.rm = TRUE)) %>%
+          arrange(desc(Gennemsnit)) %>%
+          slice_head(n = input$numTeamsPlayersLength)
+      } else {
+        data %>%
+          group_by(player_name) %>%
+          summarise(Gennemsnit = mean(pass_length, na.rm = TRUE)) %>%
+          arrange(desc(Gennemsnit)) %>%
+          slice_head(n = input$numTeamsPlayersLength)
+      }
+      
+      if (nrow(plot_data) == 0) return()
+      
+      x_var <- if (input$passLengthType == "Gennemsnit pr. hold") sym("possession_team_name") else sym("player_name")
+      
+      ggplot(plot_data, aes(x = reorder(!!x_var, Gennemsnit), y = Gennemsnit)) +
+        geom_col(fill = "#f39c12", width = 0.6) +
+        geom_text(aes(label = round(Gennemsnit, 1)), vjust = -0.5, size = 5, color = "white") +
+        theme_minimal() +
+        labs(title = paste("Gennemsnitlig afleveringslængde pr.", ifelse(input$passLengthType == "Gennemsnit pr. hold", "hold", "spiller")), x = input$passLengthType, y = "Afleveringslængde (m)") +
+        theme(plot.title = element_text(size = 36, face = "bold"),
+              axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+              axis.text.y = element_text(size = 16),
+              axis.title.x = element_text(size = 20, face = "bold"),
+              axis.title.y = element_text(size = 20, face = "bold"))
+    })
+    
+    # Heatmap over afleveringsmodtagelser
+    output$pass_heatmap <- renderPlot({
+      data <- filtered_data()
+      
+      ggplot(data) +
+        annotate_pitch(dimensions = pitch_opta, fill = "#2e8b57", colour = "white") +
+        stat_density_2d(geom = "polygon", aes(pass_endLocation_x, pass_endLocation_y, fill = ..level..), alpha = 0.8) +
+        scale_fill_viridis(option = "C") +
+        theme_void() +
+        labs(title = "Heatmap over afleveringsmodtagelser") +
+        theme(plot.title = element_text(size = 36, face = "bold", hjust = 0.4),
+              panel.spacing = unit(1, "lines"))  # Giver mere afstand mellem elementerne
+    })
+  }
+  
+  # Kør app
+  shinyApp(ui, server)
+  
