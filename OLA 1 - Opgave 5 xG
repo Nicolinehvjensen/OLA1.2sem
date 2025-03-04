@@ -14,6 +14,8 @@ library(shiny)
 library(ggplot2)
 library(ggsoccer)
 library(caret)
+library(rowr)
+library(broom)
 
 # ---------------------------------------------- #
 #           Forbindelse til MongoDB              #
@@ -36,10 +38,9 @@ con_flattened_events <- mongo(collection = "flattened_events",
                               url = "mongodb://localhost")
 
 # ---------------------------------------------- #
-#              Data retrieving                   #
+#              Data retrieving shot              #
 # ---------------------------------------------- #
 
-# Hent skuddata fra MongoDB
 query_fixed <- jsonlite::toJSON(
   list(
     "type.primary" = "shot"
@@ -47,27 +48,36 @@ query_fixed <- jsonlite::toJSON(
   auto_unbox = TRUE
 )
 
-shots_alle_alle <- con_games$find(query = query_fixed, fields = '{"_id": 0}')
+shots <- con_games$find(query = query_fixed, fields = '{"_id": 0}')
 
-# ---------------------------------------------- #
+## ---------------------------------------------- #
 #                 Data prep                      #
 # ---------------------------------------------- #  
 
-# SKAL KØRES 2 OMGANGE
-# Find de kolonner, der har været lister i lister
-nested_cols <- sapply(shots_alle_alle, is.list)  
-
-for (col in names(nested_cols[nested_cols == TRUE])) {
-  if (col %in% names(shots_alle_alle)) {
-    message("Flader ud igen: ", col)
-    shots_alle_alle <- shots_alle_alle %>% unnest_wider(col, names_sep = "_")
+# Kør loop indtil der ikke er flere nested lists
+repeat {
+  # Find kolonner med nested lists
+  nested_cols <- sapply(shots, is.list)
+  
+  # Stop løkken, hvis der ikke er flere nested lists
+  if (all(nested_cols == FALSE)) {
+    break
+  }
+  
+  # Flad de nested lists ud
+  for (col in names(nested_cols[nested_cols == TRUE])) {
+    if (col %in% names(shots)) {
+      message("Flader ud: ", col)
+      shots <- shots %>% unnest_wider(col, names_sep = "_")
+    }
   }
 }
 
-nested_shots <- shots_alle_alle
+# Gem det færdige resultat
+shots_alle <- shots
 
 # ---------------------------------------------- #
-#         Opdeling af test og træningsdata       #
+#                   Tilføj match id              #
 # ---------------------------------------------- #
 
 # Hent alle matches med deres competitionId
@@ -77,72 +87,402 @@ match_info <- con_matches$find(query = '{}', fields = '{"_id": 1, "competitionId
 colnames(match_info) <- c("matchId", "competitionId")
 
 # Merge skuddata med match-info (tilføj competitionId til skuddata)
-shots_alle <- shots_alle_alle %>%
+shots_alle <- shots_alle %>%
   left_join(match_info, by = "matchId")
-
-# Opdel baseret på competitionId
-train_data <- shots_alle %>% filter(competitionId == "692")  # Polsk liga
-test_data <- shots_alle %>% filter(competitionId == "635")   # Hollandsk liga
 
 # ---------------------------------------------- #
 #       Feature Engineering - Skuddata           #
 # ---------------------------------------------- #
 
 # Beregn afstanden til målet baseret på koordinater
-train_data <- train_data %>%
-  mutate(shot_distance = sqrt((100 - location_x)^2 + (50 - location_y)^2))
-
-test_data <- test_data %>%
+shots_alle <- shots_alle %>%
   mutate(shot_distance = sqrt((100 - location_x)^2 + (50 - location_y)^2))
 
 # Beregn skudvinkel i grader
-train_data <- train_data %>%
+shots_alle <- shots_alle %>%
   mutate(shot_angle = atan2(abs(location_y - 50), (100 - location_x)) * (180 / pi))
 
-test_data <- test_data %>%
-  mutate(shot_angle = atan2(abs(location_y - 50), (100 - location_x)) * (180 / pi))
-
-# Omdan shot_bodyPart til dummy-variabler
-train_data <- train_data %>%
+# Sørg for, at skud er opdelt i fod eller hoved
+shots_alle <- shots_alle %>%
   mutate(
-    bodyPart_right_foot = ifelse(shot_bodyPart == "right_foot", 1, 0),
-    bodyPart_left_foot = ifelse(shot_bodyPart == "left_foot", 1, 0),
-    bodyPart_head = ifelse(shot_bodyPart == "head", 1, 0)
+    shot_with_foot = ifelse(shot_bodyPart %in% c("left_foot", "right_foot"), 1, 0),
+    shot_with_head = ifelse(shot_bodyPart == "head_or_other", 1, 0)
   )
 
-test_data <- test_data %>%
-  mutate(
-    bodyPart_right_foot = ifelse(shot_bodyPart == "right_foot", 1, 0),
-    bodyPart_left_foot = ifelse(shot_bodyPart == "left_foot", 1, 0),
-    bodyPart_head = ifelse(shot_bodyPart == "head", 1, 0)
-  )
+# Opdel skud med fod og hoved i en samlet kategori
+shots_alle <- shots_alle %>%
+  mutate(shot_bodyPart = case_when(
+    shot_with_foot == 1 ~ "foot",   # Samler både left_foot og right_foot i én kategori
+    shot_with_head == 1 ~ "head",
+    TRUE ~ "other"
+  ))
+
+# Konverter til faktor
+shots_alle$shot_bodyPart <- as.factor(shots_alle$shot_bodyPart)
 
 # ---------------------------------------------- #
-#   Klassifikationsmodel for at forudsige mål   #
+# Loop i loop i loop for at finde optimale model #
+# ---------------------------------------------- #
+
+{
+
+# Definer værdier til loops
+train_sizes <- seq(0.1, 0.9, by = 0.1)  # Træningsdata fra 10% til 90%
+undersampling_ratios <- 1:10  # 1:1 op til 1:10 skud vs. mål
+cutoff_values <- c(0.05, 0.15, by = 0.02)  # Cutoff-værdier
+
+# Gem resultaterne
+results_list <- list()
+
+for (train_size in train_sizes) {
+  for (undersampling_ratio in undersampling_ratios) {
+    for (cutoff in cutoff_values) {
+      
+      # Opdel data i træning/test
+      set.seed(42)
+      train_indices <- sample(1:nrow(shots_alle), train_size * nrow(shots_alle))
+      train_data <- shots_alle[train_indices, ]
+      test_data <- shots_alle[-train_indices, ]
+      
+      # Balancer træningsdata ved at undersample skud uden mål
+      antal_mål <- sum(train_data$shot_isGoal == 1)
+      antal_skud_uden_mål <- antal_mål * undersampling_ratio
+      
+      train_data_mål <- train_data %>% filter(shot_isGoal == 1)
+      train_data_skud_uden_mål <- train_data %>% filter(shot_isGoal == 0) %>%
+        sample_n(size = min(n(), antal_skud_uden_mål), replace = FALSE)
+      
+      train_data_balanced <- bind_rows(train_data_mål, train_data_skud_uden_mål) %>%
+        arrange(matchId, minute, second)
+      
+      # Træn logistisk regression
+      xg_model <- glm(shot_isGoal ~ shot_distance + shot_angle + shot_bodyPart, 
+                      data = train_data_balanced, family = binomial)
+      
+      # Evaluér på testdata
+      test_data$predicted_prob <- predict(xg_model, newdata = test_data, type = "response")
+      test_data$predicted_goal <- ifelse(test_data$predicted_prob > cutoff, 1, 0)
+      
+      # Confusion matrix (alle skud)
+      conf_matrix <- table(Predicted = test_data$predicted_goal, Actual = test_data$shot_isGoal)
+      
+      # Precision for forudsagte mål, som er mål (hvor mange forudsagte mål er faktisk mål?)
+      if (sum(conf_matrix[2,]) > 0) {
+        precision_goals <- conf_matrix[2,2] / sum(conf_matrix[2,])  # TP / (TP + FP)
+      } else {
+        precision_goals <- NA
+      }
+      
+      # Precision for forudsagte skud, som er skud (hvor mange forudsagte skud er faktisk skud?)
+      if (sum(conf_matrix[,2]) > 0) {
+        precision_shots <- conf_matrix[2,2] / sum(conf_matrix[,2])  # TP / (TP + FN)
+      } else {
+        precision_shots <- NA
+      }
+      
+      # Hent koefficienter og p-værdier
+      coef_results <- tidy(xg_model)
+      
+      p_value_distance <- coef_results %>% filter(term == "shot_distance") %>% pull(p.value)
+      p_value_angle <- coef_results %>% filter(term == "shot_angle") %>% pull(p.value)
+      p_value_bodypart <- coef_results %>% filter(term == "shot_bodyParthead_or_other") %>% pull(p.value)
+      
+      # Gem resultater
+      results_list[[paste(train_size, undersampling_ratio, cutoff, sep = "_")]] <- 
+        data.frame(
+          Train_Size = train_size,
+          Undersampling_Ratio = undersampling_ratio,
+          Cutoff = cutoff,
+          Precision_Goals = precision_goals,
+          Precision_Shots = precision_shots,
+          P_Value_Shot_Distance = p_value_distance,
+          P_Value_Shot_Angle = p_value_angle,
+          P_Value_Shot_BodyPart = p_value_bodypart
+        )
+    }
+  }
+}
+
+# Saml alle resultater i én dataframe
+results_df <- bind_rows(results_list)
+
+# ---------------------------------------------- #
+#  Filtrering af ikke signifikante variabler ud  #
+# ---------------------------------------------- #
+
+library(dplyr)
+
+# Filtrer kun de rækker, hvor alle p-værdier er ≤ 0.05 (signifikante)
+filtered_results <- results_df %>%
+  filter(P_Value_Shot_Distance <= 0.05 &
+           P_Value_Shot_Angle <= 0.05 &
+           P_Value_Shot_BodyPart <= 0.05)
+
+
+# ---------------------------------------------- #
+#  Find den mest optimale kombination            #
+# ---------------------------------------------- #
+
+# Definer vægte (kan justeres)
+weight_precision_goals <- 0.50
+weight_precision_shots <- 0.50
+
+# Normaliser og beregn samlet score
+filtered_results <- filtered_results %>%
+  mutate(
+    Norm_Precision_Goals = (Precision_Goals - min(Precision_Goals)) / (max(Precision_Goals) - min(Precision_Goals)),
+    Norm_Precision_Shots = (Precision_Shots - min(Precision_Shots)) / (max(Precision_Shots) - min(Precision_Shots)),
+    Total_Score = (
+      weight_precision_goals * Norm_Precision_Goals +
+        weight_precision_shots * Norm_Precision_Shots
+    )
+  )
+
+# Find den bedste kombination baseret på højeste score
+best_combination <- filtered_results %>%
+  arrange(desc(Total_Score)) %>%
+  head(1)  # Top 1 bedste kombination
+
+
+#5 bedste kombinationer?
+top_5_combinations <- filtered_results %>%
+  arrange(desc(Total_Score)) %>%
+  head(5)
+
+
+}
+
+# ---------------------------------------------- #
+#   Opdeling: Undersampling af skud uden mål     #
+# ---------------------------------------------- #
+
+# Konverter shot_isGoal til numerisk (hvis ikke det allerede er)
+shots_alle <- shots_alle %>%
+  mutate(shot_isGoal = as.integer(shot_isGoal))
+
+# Opdel data i 60% træning og 40% test (før vi undersampler)
+set.seed(1)
+train_indices <- sample(1:nrow(shots_alle), 0.6 * nrow(shots_alle))
+
+train_data <- shots_alle[train_indices, ]
+test_data <- shots_alle[-train_indices, ]  # Testdata forbliver uændret
+
+# Tæl mål og skud uden mål i træningsdata
+antal_mål <- sum(train_data$shot_isGoal == 1)
+antal_skud_uden_mål <- antal_mål * 6  # Vi beholder dobbelt så mange 0'ere som 1'ere
+
+# Opdel træningsdata i skud med og uden mål
+train_data_mål <- train_data %>% filter(shot_isGoal == 1)
+train_data_skud_uden_mål <- train_data %>% filter(shot_isGoal == 0)
+
+#Begræns antallet af skud i træningsdata**
+set.seed(1)
+train_data_skud_uden_mål <- train_data_skud_uden_mål %>%
+  sample_n(size = min(nrow(train_data_skud_uden_mål), antal_skud_uden_mål), replace = FALSE)
+
+# Saml balanceret træningsdata
+train_data_balanced <- bind_rows(train_data_mål, train_data_skud_uden_mål) %>%
+  arrange(matchId, minute, second)  # Bevar rækkefølgen
+
+# Tjek fordelingen efter undersampling
+table(train_data_balanced$shot_isGoal)
+
+# ---------------------------------------------- #
+#   Logistisk regression til at forudsige mål    #
 # ---------------------------------------------- #
 
 # Opstil en logistisk regression
-xg_model <- glm(shot_isGoal ~ shot_distance + shot_angle + bodyPart_right_foot + bodyPart_left_foot + bodyPart_head,
-                data = train_data, family = binomial)
+xg_model <- glm(shot_isGoal ~ shot_distance + shot_angle + shot_bodyPart, 
+                data = train_data_balanced, family = binomial)
 
 # Modelresultater
 summary(xg_model)
 
-# Evaluering på testdata
+# Evaluering på testdata (uændret testdata!)
 test_data$predicted_prob <- predict(xg_model, newdata = test_data, type = "response")
-test_data$predicted_goal <- ifelse(test_data$predicted_prob > 0.2, 1, 0)
+test_data$predicted_goal <- ifelse(test_data$predicted_prob > 0.15, 1, 0)
 
-# Confusion matrix
-conf_matrix <- table(Predicted = test_data$predicted_goal, Actual = test_data$shot_isGoal)
-print(conf_matrix)
+# Confusion matrix for logistik regression
+conf_matrix_logit <- table(Predicted = test_data$predicted_goal, Actual = test_data$shot_isGoal)
+print(conf_matrix_logit)
 
 # ---------------------------------------------- #
-#      Kommunikation - Modelrapport              #
+#           Vi bygger en Random Forest           #
 # ---------------------------------------------- #
 
-# Visualisering af skudafstand vs. sandsynlighed for mål
-ggplot(test_data, aes(x = shot_distance, y = predicted_prob)) +
-  geom_point(alpha = 0.5) +
-  geom_smooth(method = "loess", color = "blue") +
+# Træn Random Forest-model
+set.seed(1)
+rf_model <- randomForest(
+  factor(shot_isGoal) ~ shot_distance + shot_angle + shot_bodyPart,
+  data = train_data_balanced,
+  ntree = 50,
+  importance = TRUE,
+  classwt = c(0.5, 0.5),  # Giver mål mere vægt
+)
+
+# Print modelresultater
+print(rf_model)
+
+
+# ---------------------------------------------- #
+#           Evaluér modellen på testdata         #
+# ---------------------------------------------- #
+
+# Forudsig sandsynligheder for mål i test_data
+test_data$predicted_prob_rf <- predict(rf_model, newdata = test_data, type = "prob")[,2]  # Sandsynlighed for mål
+
+# Beregn Root Squared Error (RSE)
+rse_rf <- sqrt(mean((test_data$shot_isGoal - test_data$predicted_prob_rf)^2))
+cat("Root Squared Error (RSE):", round(rse_rf, 4), "\n")
+
+# Lav Confusion Matrix for Random Forest
+test_data$predicted_goal_rf <- ifelse(test_data$predicted_prob_rf > 0.15, 1, 0)
+conf_matrix_rf <- table(Predicted = test_data$predicted_goal_rf, Actual = test_data$shot_isGoal)
+print(conf_matrix_rf)
+
+# ---------------------------------------------- #
+#           Plot fejlrate vs. antal træer        #
+# ---------------------------------------------- #
+
+# Hent fejlrate per antal træer
+rf_error <- data.frame(
+  Trees = 1:50,
+  Error = rf_model$err.rate[, 1]  # Fejlrate pr. træ
+)
+
+ggplot(rf_error, aes(x = Trees, y = Error)) +
+  geom_line(color = "#228", size = 1.2) +  # Mørkere blå linje
+  theme_minimal(base_size = 14) +  # Ensartet skrifttype-størrelse
+  theme(
+    panel.grid.major = element_line(color = "gray85"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(title = "Random Forest: Fejlrate vs. Antal Træer",
+       x = "Antal Træer", 
+       y = "Fejlrate (Misclassification Error)")
+
+
+# ---------------------------------------------- #
+#           Vis variabel-vigtighed.              #
+# ---------------------------------------------- #
+
+importance_df <- data.frame(Variable = rownames(importance(rf_model)), Importance = importance(rf_model)[, 1])
+
+ggplot(importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "#228", width = 0.7) +  # Stærk blå farve for bedre visuel effekt
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "gray85"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(title = "Variabelvigtighed i Random Forest",
+       x = "Variabel",
+       y = "Gini impurity (Variabels betydning)")
+
+
+# ---------------------------------------------- #
+#           Supplerende visualiseirng            #
+# ---------------------------------------------- #
+
+# ---------------------------------------------- #
+#   Visu af p--værdi for shot angle /p-værdi.    #
+# ---------------------------------------------- #
+
+{
+  # Indlæs nødvendige pakker
+  library(ggplot2)
+  library(dplyr)
+  
+  # Opret en tom liste til at gemme resultater
+  results <- data.frame(
+    Train_Size = numeric(),
+    Shot_Angle_Coeff = numeric(),
+    Shot_Angle_Pval = numeric()
+  )
+  
+  # Test forskellige træningsdatasætstørrelser (fra 10% til 90%)
+  set.seed(2)
+  train_sizes <- seq(0.1, 0.9, by = 0.1)
+  
+  for (size in train_sizes) {
+    # Opdel data i træning og test
+    train_indices <- sample(1:nrow(shots_alle), size * nrow(shots_alle))
+    train_data <- shots_alle[train_indices, ]
+    
+    # Tæl mål og skud uden mål
+    antal_mål <- sum(train_data$shot_isGoal == 1)
+    antal_skud_uden_mål <- antal_mål * 3  # Behold 3x så mange skud uden mål
+    
+    # Balancer data: Undersampling af 0'ere
+    train_data_mål <- train_data %>% filter(shot_isGoal == 1)
+    train_data_skud_uden_mål <- train_data %>% filter(shot_isGoal == 0) %>%
+      sample_n(size = min(nrow(.), antal_skud_uden_mål), replace = FALSE)
+    
+    train_data_balanced <- bind_rows(train_data_mål, train_data_skud_uden_mål) %>%
+      arrange(matchId, minute, second)
+    
+    # Logistisk regression
+    xg_model <- glm(shot_isGoal ~ shot_distance + shot_angle + shot_bodyPart, 
+                    data = train_data_balanced, family = binomial)
+    
+    # Hent koefficient og p-værdi for shot_angle
+    coeff <- coef(summary(xg_model))["shot_angle", "Estimate"]
+    p_val <- coef(summary(xg_model))["shot_angle", "Pr(>|z|)"]
+    
+    # Gem resultater
+    results <- rbind(results, data.frame(
+      Train_Size = size,
+      Shot_Angle_Coeff = coeff,
+      Shot_Angle_Pval = p_val
+    ))
+  }
+  
+  # Plot udviklingen af koefficienten for shot_angle
+  ggplot(results, aes(x = Train_Size, y = Shot_Angle_Coeff)) +
+    geom_line(color = "blue", size = 1) +
+    geom_point(color = "blue", size = 2) +
+    theme_minimal() +
+    labs(title = "Udvikling af koefficient for shot_angle",
+         x = "Andel af træningsdata (%)", y = "Koefficient for shot_angle")
+  
+  # Plot udviklingen af p-værdien for shot_angle
+  ggplot(results, aes(x = Train_Size, y = Shot_Angle_Pval)) +
+    geom_line(color = "red", size = 1) +
+    geom_point(color = "red", size = 2) +
+    geom_hline(yintercept = 0.05, linetype = "dashed", color = "black") +
+    theme_minimal() +
+    labs(title = "P-værdien på shot angle, er meget svingende ift. størrelsen på træningsdata",
+         x = "Andel af træningsdata (%)", y = "P-værdi") +
+    annotate("text", x = 0.5, y = 0.06, label = "Signifikansniveau (0.05)", color = "black", size = 4, hjust = 0)
+  
+  }
+
+
+library(ggplot2)
+library(dplyr)
+
+# Filtrer data for skud med vinkel = 0
+shots_angle_0 <- shots_alle %>% filter(shot_angle == 0)
+
+# Tæl antal skud og mål
+shot_summary <- shots_angle_0 %>%
+  group_by(shot_isGoal) %>%
+  summarise(count = n()) %>%
+  mutate(label = ifelse(shot_isGoal == 1, "Mål", "Ingen mål"))
+
+# Plot antal skud og mål
+ggplot(shot_summary, aes(x = label, y = count, fill = label)) +
+  geom_col() +
+  scale_fill_manual(values = c("Ingen mål" = "#228", "Mål" = "green")) +
   theme_minimal() +
-  labs(title = "Sandsynlighed for mål baseret på skudafstand", x = "Afstand til mål (meter)", y = "Sandsynlighed for mål")
+  labs(title = "Antal skud og mål ved skudvinkel = 0",
+       x = "Resultat",
+       y = "Antal skud",
+       fill = "Resultat") +
+  theme(text = element_text(size = 14))
+
